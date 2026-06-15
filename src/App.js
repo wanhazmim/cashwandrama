@@ -15,7 +15,7 @@ const COIN_TO_MYR   = 0.01;
 const AD_DURATION    = 10;
 const AD_SKIP_AFTER  = 5;
 
-const SCREEN = { AUTH: 'auth', HOME: 'home', PLAYER: 'player', WALLET: 'wallet' };
+const SCREEN = { AUTH: 'auth', HOME: 'home', PLAYER: 'player', WALLET: 'wallet', ADMIN: 'admin' };
 const GENRES  = ['All', 'Romance', 'Action', 'Thriller'];
 
 const DRAMAS = [
@@ -125,10 +125,11 @@ function AuthScreen({ onAuth }) {
 }
 
 // ── Navbar ────────────────────────────────────────────────────────────────────
-function Navbar({ screen, setScreen, coins, onLogout }) {
+function Navbar({ screen, setScreen, coins, isAdmin, onLogout }) {
   const items = [
     { key: SCREEN.HOME,   icon: '🎬', label: 'Drama'  },
     { key: SCREEN.WALLET, icon: '👛', label: 'Wallet' },
+    ...(isAdmin ? [{ key: SCREEN.ADMIN, icon: '🛡️', label: 'Admin' }] : []),
   ];
   return (
     <nav className="navbar">
@@ -531,34 +532,214 @@ function WalletScreen({ coins, onWithdraw }) {
   );
 }
 
+// ── AdminPanel ────────────────────────────────────────────────────────────────
+function AdminPanel() {
+  const [requests, setRequests] = useState([]);
+  const [loading,  setLoading]  = useState(true);
+  const [acting,   setActing]   = useState(null); // id of row currently being actioned
+  const [error,    setError]    = useState('');
+
+  async function fetchPending() {
+    setLoading(true);
+    setError('');
+    const { data, error: err } = await supabase
+      .from('withdrawal_requests')
+      .select(`
+        id,
+        user_id,
+        amount_rm,
+        coins,
+        bank_name,
+        account_number,
+        created_at,
+        profiles ( email )
+      `)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true });
+    if (err) setError(err.message);
+    else     setRequests(data || []);
+    setLoading(false);
+  }
+
+  useEffect(() => { fetchPending(); }, []); // eslint-disable-line
+
+  async function handleApprove(req) {
+    setActing(req.id);
+    setError('');
+    try {
+      // Mark request approved
+      const { error: e1 } = await supabase
+        .from('withdrawal_requests')
+        .update({ status: 'approved' })
+        .eq('id', req.id);
+      if (e1) throw e1;
+
+      // Fetch current balance so we can subtract safely
+      const { data: profile, error: e2 } = await supabase
+        .from('profiles')
+        .select('coins')
+        .eq('id', req.user_id)
+        .single();
+      if (e2) throw e2;
+
+      const { error: e3 } = await supabase
+        .from('profiles')
+        .update({ coins: Math.max(0, (profile.coins ?? 0) - req.coins) })
+        .eq('id', req.user_id);
+      if (e3) throw e3;
+
+      await fetchPending();
+    } catch (err) {
+      setError(err.message || 'Failed to approve request');
+    } finally {
+      setActing(null);
+    }
+  }
+
+  async function handleReject(req) {
+    setActing(req.id);
+    setError('');
+    try {
+      const { error: err } = await supabase
+        .from('withdrawal_requests')
+        .update({ status: 'rejected' })
+        .eq('id', req.id);
+      if (err) throw err;
+      await fetchPending();
+    } catch (err) {
+      setError(err.message || 'Failed to reject request');
+    } finally {
+      setActing(null);
+    }
+  }
+
+  function fmtDate(iso) {
+    return new Date(iso).toLocaleString('en-MY', {
+      day: '2-digit', month: 'short', year: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    });
+  }
+
+  return (
+    <div className="admin-screen">
+      <div className="home-header">
+        <h1 className="page-title">Admin Panel</h1>
+        <button className="btn-refresh" onClick={fetchPending} disabled={loading}>
+          ⟳ Refresh
+        </button>
+      </div>
+
+      {error && <div className="admin-error">{error}</div>}
+
+      {loading ? (
+        <div className="admin-state">Loading…</div>
+      ) : requests.length === 0 ? (
+        <div className="admin-state">
+          <span style={{ fontSize: 32 }}>✅</span>
+          <p>No pending withdrawals</p>
+        </div>
+      ) : (
+        <div className="admin-list">
+          {requests.map(req => {
+            const busy = acting === req.id;
+            return (
+              <div key={req.id} className="admin-card">
+                <div className="admin-card-head">
+                  <span className="admin-email" title={req.profiles?.email ?? req.user_id}>
+                    {req.profiles?.email ?? req.user_id}
+                  </span>
+                  <span className="admin-date">{fmtDate(req.created_at)}</span>
+                </div>
+
+                <div className="admin-card-body">
+                  <div className="admin-row">
+                    <span className="admin-lbl">Amount</span>
+                    <span className="admin-val admin-rm">RM {Number(req.amount_rm).toFixed(2)}</span>
+                  </div>
+                  <div className="admin-row">
+                    <span className="admin-lbl">Coins deducted</span>
+                    <span className="admin-val">🪙 {req.coins}</span>
+                  </div>
+                  <div className="admin-row">
+                    <span className="admin-lbl">Bank / Method</span>
+                    <span className="admin-val">{req.bank_name}</span>
+                  </div>
+                  <div className="admin-row">
+                    <span className="admin-lbl">Account</span>
+                    <span className="admin-val admin-acct">{req.account_number}</span>
+                  </div>
+                </div>
+
+                <div className="admin-card-actions">
+                  <button
+                    className="btn-approve"
+                    disabled={busy}
+                    onClick={() => handleApprove(req)}
+                  >
+                    {busy ? '…' : '✓ Approve'}
+                  </button>
+                  <button
+                    className="btn-reject"
+                    disabled={busy}
+                    onClick={() => handleReject(req)}
+                  >
+                    {busy ? '…' : '✕ Reject'}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── App (root) ────────────────────────────────────────────────────────────────
 export default function App() {
   const [user,    setUser]    = useState(null);
   const [coins,   setCoins]   = useState(0);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [screen,  setScreen]  = useState(SCREEN.HOME);
   const [drama,   setDrama]   = useState(null);
   const [showAd,  setShowAd]  = useState(false);
   const [pending, setPending] = useState(0); // coins waiting for ad
   const [booting, setBooting] = useState(true);
 
+  async function loadAdminStatus(userId) {
+    try {
+      const { data } = await supabase
+        .from('profiles')
+        .select('is_admin')
+        .eq('id', userId)
+        .single();
+      setIsAdmin(data?.is_admin === true);
+    } catch {
+      setIsAdmin(false);
+    }
+  }
+
   // Restore session on mount
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    async function init() {
+      const { data: { session } } = await supabase.auth.getSession();
       if (session?.user) {
         setUser(session.user);
         setCoins(session.user.user_metadata?.coins ?? 0);
+        await loadAdminStatus(session.user.id);
         setScreen(SCREEN.HOME);
       } else {
         setScreen(SCREEN.AUTH);
       }
       setBooting(false);
-    });
+    }
+    init();
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_ev, session) => {
-      if (!session) { setUser(null); setScreen(SCREEN.AUTH); }
+      if (!session) { setUser(null); setIsAdmin(false); setScreen(SCREEN.AUTH); }
     });
     return () => subscription.unsubscribe();
-  }, []);
+  }, []); // eslint-disable-line
 
   async function persist(newCoins) {
     setCoins(newCoins);
@@ -569,9 +750,10 @@ export default function App() {
     }
   }
 
-  function handleAuth(authUser, startCoins) {
+  async function handleAuth(authUser, startCoins) {
     setUser(authUser);
     setCoins(startCoins);
+    await loadAdminStatus(authUser.id);
     setScreen(SCREEN.HOME);
   }
 
@@ -602,6 +784,7 @@ export default function App() {
     await supabase.auth.signOut();
     setUser(null);
     setCoins(0);
+    setIsAdmin(false);
     setDrama(null);
     setScreen(SCREEN.AUTH);
   }
@@ -635,6 +818,8 @@ export default function App() {
           />
         ) : screen === SCREEN.WALLET ? (
           <WalletScreen coins={coins} onWithdraw={handleWithdraw} />
+        ) : screen === SCREEN.ADMIN && isAdmin ? (
+          <AdminPanel />
         ) : (
           <HomeScreen
             coins={coins}
@@ -644,7 +829,7 @@ export default function App() {
       </div>
 
       {screen !== SCREEN.PLAYER && (
-        <Navbar screen={screen} setScreen={setScreen} coins={coins} onLogout={handleLogout} />
+        <Navbar screen={screen} setScreen={setScreen} coins={coins} isAdmin={isAdmin} onLogout={handleLogout} />
       )}
     </div>
   );
